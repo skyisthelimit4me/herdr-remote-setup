@@ -30,6 +30,7 @@ ENABLE_SSH=0
 ENROLL=0
 ENROLL_PORT="${HERDR_ENROLL_PORT:-0}"
 ENROLL_TTL="${HERDR_ENROLL_TTL:-600}"
+ENROLL_BIND=""
 ENROLL_TOKEN=""
 
 C_RESET=""; C_RED=""; C_GRN=""; C_YEL=""; C_BLU=""; C_CYN=""
@@ -341,9 +342,14 @@ if [ "$ENROLL" -eq 1 ]; then
     PORTFILE="$STATE_DIR/enroll.port"
     rm -f "$PORTFILE" 2>/dev/null || true
 
+    # The endpoint holds a one-time code, so it listens on one address only:
+    # the Tailscale address when there is one, otherwise the loopback address.
+    ENROLL_BIND="${HERDR_ENROLL_BIND:-${TS_IP:-127.0.0.1}}"
+
     # Port 0 lets the kernel pick a free port. The platform binds some ports
     # (for example 127.0.0.1:8791); a fixed port can collide and fail silently.
     HERDR_ENROLL_TOKEN="$ENROLL_TOKEN" \
+    HERDR_ENROLL_BIND="$ENROLL_BIND" \
     HERDR_ENROLL_PORT="$ENROLL_PORT" \
     HERDR_ENROLL_TTL="$ENROLL_TTL" \
     HERDR_ENROLL_LOG="$STATE_DIR/enroll.log" \

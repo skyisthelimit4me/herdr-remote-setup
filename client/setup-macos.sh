@@ -870,6 +870,8 @@ if [ -f "$_machines_txt" ]; then
 else
     printf '%s\n' "$MACHINE_NAME" > "$_machines_txt"
 fi
+printf '%s\n' "$MACHINE_NAME" > "$STATE_DIR/last-machine.txt" 2>/dev/null || true
+chmod 600 "$STATE_DIR/last-machine.txt" 2>/dev/null || true
 
 # ---------------------------------------------------------------
 if [ "$NO_WATCHDOG" -eq 0 ]; then

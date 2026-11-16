@@ -5,7 +5,12 @@
 # server are left untouched.
 #
 # Usage:
-#   bash watchdog-macos.sh [--dry-run] [--stale-minutes 3] [--quiet] [--client-log PATH]
+#   bash watchdog-macos.sh [--dry-run] [--stale-minutes 3] [--machine NAME]
+#                          [--quiet] [--client-log PATH]
+#
+# The relaunched client is started with --machine NAME. The name comes from
+# --machine, then HERDR_MACHINE, then the last label that the macOS setup
+# recorded in ~/Library/Application Support/HerdrSetup/machines.txt.
 #
 # Exit codes:
 #   0  healthy, nothing to do
@@ -24,6 +29,7 @@ DRY_RUN=0
 STALE_MINUTES=3
 QUIET=0
 CLIENT_LOG_ARG=""
+MACHINE_ARG=""
 ACTION="run"
 
 while [ $# -gt 0 ]; do
@@ -58,6 +64,18 @@ while [ $# -gt 0 ]; do
             ;;
         --client-log=*)
             CLIENT_LOG_ARG="${1#--client-log=}"
+            shift
+            ;;
+        --machine)
+            if [ $# -lt 2 ]; then
+                printf 'X --machine needs a value\n' >&2
+                exit "$EXIT_CANNOT"
+            fi
+            MACHINE_ARG="$2"
+            shift 2
+            ;;
+        --machine=*)
+            MACHINE_ARG="${1#--machine=}"
             shift
             ;;
         --help|-h)
@@ -105,13 +123,39 @@ classify_lines() {
     done
 }
 
-is_client_command() {
-    case "$1" in
-        herdr|*/herdr) return 0 ;;
-        herdr\ --machine\ *|*/herdr\ --machine\ *) return 0 ;;
-        herdr\ --machine=*|*/herdr\ --machine=*) return 0 ;;
-    esac
-    return 1
+# Return true only for arguments that launch the TUI.
+#
+# Herdr accepts global options before an optional command. A command such as
+# `herdr --machine host agent list` is not a TUI, even when the first argument
+# is an option. Consume the options and their values, then reject any remaining
+# positional token.
+_is_tui_command() {
+    set -f
+    set -- $1
+    set +f
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --session|--machine|--remote|--remote-keybindings)
+                if [ $# -lt 2 ]; then
+                    return 1
+                fi
+                shift 2
+                ;;
+            --session=*|--machine=*|--remote=*|--remote-keybindings=*)
+                shift
+                ;;
+            --handoff)
+                shift
+                ;;
+            --help|-h|--version|-V|--default-config|--skill)
+                return 1
+                ;;
+            *)
+                return 1
+                ;;
+        esac
+    done
+    return 0
 }
 
 self_test() {
@@ -159,15 +203,24 @@ handshake succeeded
 EOF
     check "recovery wins" "$([ "$STATE" = "ok" ] && echo 0 || echo 1)"
 
-    is_client_command "herdr"; check "bare client matches" "$?"
-    is_client_command "/Users/alice/.local/bin/herdr --machine box"; check "client path matches" "$?"
-    is_client_command "herdr status"; check "status command is excluded" "$([ $? -ne 0 ] && echo 0 || echo 1)"
-    is_client_command "herdr machine status"; check "machine command is excluded" "$([ $? -ne 0 ] && echo 0 || echo 1)"
-    is_client_command "herdr server"; check "server is excluded" "$([ $? -ne 0 ] && echo 0 || echo 1)"
-    is_client_command "herdr remote-client-bridge"; check "bridge is excluded" "$([ $? -ne 0 ] && echo 0 || echo 1)"
-    is_client_command "herdr-core connect"; check "herdr-core is excluded" "$([ $? -ne 0 ] && echo 0 || echo 1)"
-    is_client_command "ssh -T vii@host exec herdr-core connect"; check "ssh helper is excluded" "$([ $? -ne 0 ] && echo 0 || echo 1)"
-    is_client_command "node /tmp/herdr-review.mjs"; check "review job is excluded" "$([ $? -ne 0 ] && echo 0 || echo 1)"
+    _is_tui_command ""
+    check "bare client matches" "$?"
+    _is_tui_command "--machine box"
+    check "client with a machine matches" "$?"
+    _is_tui_command "--machine=box --session main"
+    check "client with options matches" "$?"
+    _is_tui_command "status"
+    check "status command is excluded" "$([ $? -ne 0 ] && echo 0 || echo 1)"
+    _is_tui_command "machine status"
+    check "machine command is excluded" "$([ $? -ne 0 ] && echo 0 || echo 1)"
+    _is_tui_command "server"
+    check "server is excluded" "$([ $? -ne 0 ] && echo 0 || echo 1)"
+    _is_tui_command "remote-client-bridge"
+    check "bridge is excluded" "$([ $? -ne 0 ] && echo 0 || echo 1)"
+    _is_tui_command "--help"
+    check "help flag is excluded" "$([ $? -ne 0 ] && echo 0 || echo 1)"
+    _is_tui_command "--machine"
+    check "option without a value is excluded" "$([ $? -ne 0 ] && echo 0 || echo 1)"
 
     if [ "$failures" -ne 0 ]; then
         printf 'self-test failed (%d)\n' "$failures"
@@ -182,10 +235,12 @@ if [ "$ACTION" = "help" ]; then
 Herdr remote watchdog (macOS)
 
 Usage:
-  bash watchdog-macos.sh [--dry-run] [--stale-minutes N] [--quiet] [--client-log PATH]
+  bash watchdog-macos.sh [--dry-run] [--stale-minutes N] [--machine NAME]
+                         [--quiet] [--client-log PATH]
 
   --dry-run            Report what would be stopped, exit 11
   --stale-minutes N    Only act when the client log is older than N minutes (default 3)
+  --machine NAME       Label of the remote machine to relaunch the client for
   --quiet              Do not write to stdout
   --client-log PATH    Override the client log path
 
@@ -278,6 +333,32 @@ if [ "$_age_sec" -lt "$_stale_sec" ]; then
     exit "$EXIT_OK"
 fi
 
+
+# Find the TUI client only. The match is on the program name, not a substring
+# of the whole command line: `herdr-core connect`, an SSH control master, and a
+# Node helper all carry "herdr" in their arguments and none of them is the
+# client. The local server, API commands, and this watchdog are skipped too.
+PIDS=""
+for _pid in $(pgrep -f 'herdr' 2>/dev/null); do
+    _comm="$(ps -o comm= -p "$_pid" 2>/dev/null)"
+    _comm="${_comm#"${_comm%%[! ]*}"}"
+    if [ "${_comm##*/}" != "herdr" ]; then
+        continue
+    fi
+    _cmd="$(ps -o command= -p "$_pid" 2>/dev/null)"
+    if [ -z "$_cmd" ]; then
+        continue
+    fi
+    _rest="${_cmd#"$_comm"}"
+    _rest="${_rest#"${_rest%%[! ]*}"}"
+    if ! _is_tui_command "$_rest"; then
+        continue
+    fi
+    PIDS="$PIDS $_pid"
+done
+PIDS="${PIDS# }"
+
+# The relaunch needs the client binary, whatever the selector finds.
 HERDR=""
 if command -v herdr >/dev/null 2>&1; then
     HERDR="$(command -v herdr)"
@@ -293,21 +374,6 @@ if [ -z "$HERDR" ]; then
     log "herdr not found"
     exit "$EXIT_CANNOT"
 fi
-
-# Find the TUI client only: the local server, the remote bridge, and this
-# watchdog must never be stopped.
-PIDS=""
-for _pid in $(pgrep -f 'herdr($| )' 2>/dev/null); do
-    _cmd="$(ps -o command= -p "$_pid" 2>/dev/null)"
-    if [ -z "$_cmd" ]; then
-        continue
-    fi
-    if ! is_client_command "$_cmd"; then
-        continue
-    fi
-    PIDS="$PIDS $_pid"
-done
-PIDS="${PIDS# }"
 
 if [ -z "$PIDS" ]; then
     log "no local client process; nothing to restart"
@@ -342,9 +408,45 @@ if ! command -v osascript >/dev/null 2>&1; then
     exit "$EXIT_CANNOT"
 fi
 
-_esc="$(printf '%s' "$HERDR" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+MACHINE="$MACHINE_ARG"
+if [ -z "$MACHINE" ]; then
+    MACHINE="${HERDR_MACHINE:-}"
+fi
+if [ -z "$MACHINE" ]; then
+    _state="$HOME/Library/Application Support/HerdrSetup"
+    _last="$_state/last-machine.txt"
+    _labels="$_state/machines.txt"
+    if [ -f "$_last" ]; then
+        MACHINE="$(grep -v '^[[:space:]]*$' "$_last" 2>/dev/null | tail -n 1 | tr -d '\r')"
+        MACHINE="${MACHINE#"${MACHINE%%[! ]*}"}"
+        MACHINE="${MACHINE%"${MACHINE##*[! ]}"}"
+    elif [ -f "$_labels" ]; then
+        MACHINE="$(grep -v '^[[:space:]]*$' "$_labels" 2>/dev/null | tail -n 1 | tr -d '\r')"
+        MACHINE="${MACHINE#"${MACHINE%%[! ]*}"}"
+        MACHINE="${MACHINE%"${MACHINE##*[! ]}"}"
+    fi
+fi
+case "$MACHINE" in
+    *[!A-Za-z0-9._@:-]*) MACHINE="" ;;
+esac
+if [ -z "$MACHINE" ]; then
+    log "no machine label; relaunching without --machine"
+fi
 
-if ! osascript -e 'tell application "Terminal" to do script "exec '"$_esc"'"' >/dev/null 2>&1; then
+_quote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+_esc="$(_quote "$HERDR")"
+if [ -n "$MACHINE" ]; then
+    _m_esc="$(_quote "$MACHINE")"
+    _launch="exec $_esc --machine $_m_esc"
+else
+    _launch="exec $_esc"
+fi
+_launch="$(printf '%s' "$_launch" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')"
+
+if ! osascript -e 'tell application "Terminal" to do script "'"$_launch"'"' >/dev/null 2>&1; then
     log "osascript failed to open a Terminal window"
     exit "$EXIT_CANNOT"
 fi
@@ -353,5 +455,5 @@ if ! osascript -e 'tell application "Terminal" to activate' >/dev/null 2>&1; the
     exit "$EXIT_CANNOT"
 fi
 
-log "relaunched $HERDR in Terminal"
+log "relaunched $HERDR${MACHINE:+ --machine $MACHINE} in Terminal"
 exit "$EXIT_RESTARTED"

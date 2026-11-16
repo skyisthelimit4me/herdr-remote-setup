@@ -17,9 +17,12 @@ jobs:
       - name: Public scan
         run: python3 tools/check-public.py
 
+      - name: Package manifest
+        run: sha256sum -c MANIFEST.sha256
+
       - name: Python syntax
         run: |
-          python3 -m py_compile host/enroll.py host/pair.py tools/check-public.py tools/mock-ts-api.py
+          python3 -m py_compile host/enroll.py host/hostlib.py host/pair.py tools/check-public.py tools/mock-ts-api.py
 
       - name: Shell syntax
         run: |
@@ -45,6 +48,12 @@ jobs:
           bash host/guest-key.sh --self-test
           bash app/herdr-setup.sh --self-test
           bash client/setup-macos.sh --self-test
+
+      - name: Host services
+        run: python3 tools/test-host-services.py
+
+      - name: Boot guard
+        run: python3 tools/test-boot-guard.py
 
       - name: Pairing service tests
         run: python3 tools/test-pair.py
@@ -130,6 +139,9 @@ jobs:
           for f in $(git ls-files '*.sh' '*.command'); do
             bash -n "$f"
           done
+
+      - name: Watchdog selector
+        run: python3 tools/test-watchdog-selector.py
 
       - name: LaunchAgent plist
         run: bash client/install-watchdog-macos.sh --dry-run

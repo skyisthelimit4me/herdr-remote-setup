@@ -19,26 +19,22 @@ Security:
 """
 
 import argparse
-import hmac
+import base64
 import json
 import os
 import re
 import secrets
+import struct
 import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import hostlib
+
 SERVICE = "herdr-pair"
 PROTOCOL = 1
 MAX_BODY = 8192
-KEY_PREFIXES = (
-    "ssh-ed25519 ",
-    "ssh-rsa ",
-    "ecdsa-sha2-",
-    "sk-ssh-ed25519@",
-    "sk-ecdsa-sha2-",
-)
 
 ARGS = None
 PIN = ""
@@ -77,24 +73,16 @@ def write_text(path, text):
 
 def set_pin(pin):
     global PIN
-    PIN = pin
-    write_text(PIN_FILE, PIN + "\n")
+    with LOCK:
+        PIN = pin
+        write_text(PIN_FILE, PIN + "\n")
     print("", flush=True)
     print("  PIN: %s" % PIN, flush=True)
     print("", flush=True)
 
 
 def valid_key(key):
-    if not key or len(key) > 2000:
-        return False
-    if "\n" in key or "\r" in key:
-        return False
-    if not key.startswith(KEY_PREFIXES):
-        return False
-    parts = key.split()
-    if len(parts) < 2:
-        return False
-    return len(parts[1]) >= 32
+    return hostlib.parse_key(key) is not None
 
 
 def valid_pin(pin):
@@ -104,7 +92,7 @@ def valid_pin(pin):
 def compare_pin(pin):
     if not valid_pin(pin) or not valid_pin(PIN):
         return False
-    return hmac.compare_digest(pin.encode("ascii"), PIN.encode("ascii"))
+    return hostlib.secret_equals(pin, PIN)
 
 
 def sanitize(value, limit=64):
@@ -114,52 +102,54 @@ def sanitize(value, limit=64):
 
 def append_key(key, name):
     path = os.path.expanduser(ARGS.authorized_keys)
-    directory = os.path.dirname(path) or "."
-    os.makedirs(directory, exist_ok=True)
-    try:
-        os.chmod(directory, 0o700)
-    except OSError:
-        pass
-
-    existing = ""
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8", errors="replace") as handle:
-            existing = handle.read()
-
-    blob = key.split()[1]
-    present = any(
-        token == blob
-        for line in existing.splitlines()
-        for token in line.split()
-    )
-    if present:
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
-        return True
-
-    line = key.strip()
-    with open(path, "a", encoding="utf-8") as handle:
-        if existing and not existing.endswith("\n"):
-            handle.write("\n")
-        handle.write(line + "\n")
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
-    return False
+def append_key(key, name):
+    path = os.path.expanduser(ARGS.authorized_keys)
+    return hostlib.append_key(path, key)
 
 
-def rate_limited_locked(source):
+def check_attempt(source, supplied):
+    """Check and consume the PIN in one locked step."""
+    global PIN
     now = time.time()
-    times = [t for t in FAILS.get(source, []) if now - t < 300]
-    FAILS[source] = times
-    return len(times) >= 5
+    with LOCK:
+        times = [t for t in FAILS.get(source, []) if now - t < 300]
+        if len(times) >= 5:
+            FAILS[source] = times
+            return "limited", None
+        if not hostlib.secret_equals(supplied, PIN):
+            times.append(now)
+            FAILS[source] = times
+            return "bad", None
+        claimed = PIN
+        PIN = ""
+        FAILS[source] = times
+        return "ok", claimed
+
+
+def restore_pin(claimed):
+    global PIN
+    if not claimed:
+        return
+    with LOCK:
+        if not PIN:
+            PIN = claimed
+            write_text(PIN_FILE, PIN + "\n")
 
 
 def record_fail_locked(source):
     FAILS.setdefault(source, []).append(time.time())
+
+
+def record_fail(source):
+    with LOCK:
+        record_fail_locked(source)
+
+
+def _test_key(key_type):
+    material = b"k" * 32
+    inner = (struct.pack(">I", len(key_type)) + key_type.encode()
+             + struct.pack(">I", len(material)) + material)
+    return "%s %s" % (key_type, base64.b64encode(inner).decode())
 
 
 def self_test():
@@ -174,14 +164,16 @@ def self_test():
             failures += 1
             print("FAIL %s" % name)
 
-    fake_key = "ssh-ed25519 " + ("A" * 40)
+    fake_key = _test_key("ssh-ed25519")
     check("valid pin", valid_pin("123456"))
     check("short pin", not valid_pin("12345"))
     check("non-digit pin", not valid_pin("12345a"))
     check("non-ascii pin", not valid_pin("é"))
     check("valid key", valid_key(fake_key))
-    check("key with newline", not valid_key(fake_key + "\n"))
-    check("rsa key", valid_key("ssh-rsa " + ("A" * 40)))
+    check("key with internal newline",
+          not valid_key(fake_key[:30] + chr(10) + fake_key[30:]))
+    check("rsa key", valid_key(_test_key("ssh-rsa")))
+    check("truncated key", not valid_key(fake_key[:40]))
     check("name is sanitized", sanitize("a/b c") == "a_b_c")
 
     old_pin = PIN
@@ -196,6 +188,13 @@ def self_test():
         return 1
     print("self-test ok")
     return 0
+
+
+class PairServer(ThreadingHTTPServer):
+    """Concurrent server with a backlog for a burst of reconnect attempts."""
+
+    daemon_threads = True
+    request_queue_size = 128
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -224,10 +223,22 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(404, {"ok": False, "error": "not found"})
 
     def do_POST(self):  # noqa: N802
-        global PIN
+        try:
+            self._request()
+        except Exception as exc:  # noqa: BLE001 - the handler must not die
+            source = self.client_address[0]
+            record_fail(source)
+            log("error source=%s reason=%s" % (source, exc))
+            try:
+                self._json(500, {"ok": False, "error": "internal error"})
+            except Exception:
+                pass
+
+    def _request(self):
         if self.path != "/api/request":
             return self._json(404, {"ok": False, "error": "not found"})
 
+        source = self.client_address[0]
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if length <= 0 or length > MAX_BODY:
@@ -242,39 +253,34 @@ class Handler(BaseHTTPRequestHandler):
         key = str(data.get("publicKey", "")).strip()
         name = sanitize(data.get("name", "client"))
 
-        source = self.client_address[0]
-        status = 500
-        payload = {"ok": False, "error": "internal error"}
+        attempt, claimed = check_attempt(source, pin)
+        if attempt == "limited":
+            log("deny source=%s reason=rate-limit" % source)
+            return self._json(429, {"ok": False, "error": "too many attempts"})
+        if attempt == "bad":
+            log("deny source=%s name=%s reason=bad-pin" % (source, name))
+            return self._json(401, {"ok": False, "error": "bad pin"})
 
-        with LOCK:
-            if rate_limited_locked(source):
-                log("deny source=%s reason=rate-limit" % source)
-                status, payload = 429, {"ok": False, "error": "too many attempts"}
-            elif not compare_pin(pin):
-                record_fail_locked(source)
-                log("deny source=%s name=%s reason=bad-pin" % (source, name))
-                status, payload = 401, {"ok": False, "error": "bad pin"}
-            elif not valid_key(key):
-                log("deny source=%s name=%s reason=bad-key" % (source, name))
-                status, payload = 400, {"ok": False, "error": "bad key"}
-            else:
-                try:
-                    already = append_key(key, name)
-                except OSError as exc:
-                    log("error name=%s source=%s reason=%s" % (name, source, exc))
-                    status, payload = 500, {"ok": False, "error": "cannot write keys"}
-                else:
-                    log("paired name=%s source=%s result=%s" % (
-                        name, source, "already-present" if already else "added"))
-                    status, payload = 200, {"ok": True, "alreadyPresent": already}
-                    if ARGS.once:
-                        PIN = ""
-                    else:
-                        set_pin(new_pin())
+        if not valid_key(key):
+            restore_pin(claimed)
+            log("deny source=%s name=%s reason=bad-key" % (source, name))
+            return self._json(400, {"ok": False, "error": "bad key"})
 
-        self._json(status, payload)
+        try:
+            already = append_key(key, name)
+        except (OSError, ValueError) as exc:
+            restore_pin(claimed)
+            log("error name=%s source=%s reason=%s" % (name, source, exc))
+            return self._json(500, {"ok": False, "error": "cannot write keys"})
 
-        if status == 200 and ARGS.once:
+        if not ARGS.once:
+            set_pin(new_pin())
+
+        log("paired name=%s source=%s result=%s" % (
+            name, source, "already-present" if already else "added"))
+        self._json(200, {"ok": True, "alreadyPresent": already})
+
+        if ARGS.once:
             threading.Thread(target=SERVER.shutdown, daemon=True).start()
 
 
@@ -310,7 +316,7 @@ def main():
         return 2
 
     try:
-        SERVER = ThreadingHTTPServer((args.bind, args.port), Handler)
+        SERVER = PairServer((args.bind, args.port), Handler)
     except OSError as exc:
         print("cannot listen on %s:%s: %s" % (args.bind, args.port, exc),
               file=sys.stderr)
