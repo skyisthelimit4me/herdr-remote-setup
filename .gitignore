@@ -10,6 +10,7 @@
 
 # Release archives and local build output
 /herdr-remote-setup-v*.zip
+/releases/
 /dist/
 
 # Python cache
