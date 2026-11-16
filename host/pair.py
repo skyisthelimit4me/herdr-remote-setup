@@ -58,6 +58,17 @@ def log(msg):
             pass
 
 
+def shutdown_after_grace(delay=0.5):
+    """Stop the listener after a short grace.
+
+    --once means one successful pairing, not one concurrent client. A request
+    that arrived in the same burst must still get its answer, so the accept
+    loop keeps running long enough to serve it before the socket closes.
+    """
+    time.sleep(delay)
+    SERVER.shutdown()
+
+
 def new_pin():
     return "%06d" % (100000 + secrets.randbelow(900000))
 
@@ -193,7 +204,10 @@ def self_test():
 class PairServer(ThreadingHTTPServer):
     """Concurrent server with a backlog for a burst of reconnect attempts."""
 
-    daemon_threads = True
+    daemon_threads = False
+    # server_close() waits for the handler, so a shutdown after one
+    # success cannot cut the last response in half.
+    block_on_close = True
     request_queue_size = 128
 
 
@@ -281,7 +295,7 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {"ok": True, "alreadyPresent": already})
 
         if ARGS.once:
-            threading.Thread(target=SERVER.shutdown, daemon=True).start()
+            threading.Thread(target=shutdown_after_grace, daemon=True).start()
 
 
 def main():

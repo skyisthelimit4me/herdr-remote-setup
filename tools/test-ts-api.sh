@@ -28,6 +28,10 @@ trap cleanup EXIT INT TERM
 
 command -v python3 >/dev/null 2>&1 || { echo "python3 is required"; exit 2; }
 
+posix_modes() {
+    python3 -c 'import os, sys; sys.exit(0 if hasattr(os, "geteuid") else 1)'
+}
+
 comment() { printf '\n== %s ==\n' "$1"; }
 
 check() { # name, condition result (0 ok)
@@ -299,12 +303,16 @@ expect_rc 2 $? "missing API key exits 2"
 expect_out "$out" "no Tailscale API token" "missing API key says so"
 
 comment "ensure-acl: token mode"
-chmod 644 "$WORK/api.key"
-out="$WORK/out-mode.txt"
-bash "$ACL" --no-acl-write >"$out" 2>&1
-expect_rc 2 $? "group-readable token exits 2"
-expect_out "$out" "readable by group or others" "group-readable token says so"
-chmod 600 "$WORK/api.key"
+if posix_modes; then
+    chmod 644 "$WORK/api.key"
+    out="$WORK/out-mode.txt"
+    bash "$ACL" --no-acl-write >"$out" 2>&1
+    expect_rc 2 $? "group-readable token exits 2"
+    expect_out "$out" "readable by group or others" "group-readable token says so"
+    chmod 600 "$WORK/api.key"
+else
+    echo "skip: POSIX mode bits are not available here"
+fi
 
 # ---------- guest-key ----------
 comment "guest-key: create a join code"
@@ -332,13 +340,17 @@ PY
 stop_api
 
 comment "guest-key: token mode"
-chmod 644 "$WORK/api.key"
-out="$WORK/out-key-mode.txt"
-err="$WORK/out-key-mode.err"
-bash "$KEY" >"$out" 2>"$err"
-expect_rc 2 $? "guest-key refuses group-readable token"
-expect_out "$err" "readable by group or others" "guest-key token mode says so"
-chmod 600 "$WORK/api.key"
+if posix_modes; then
+    chmod 644 "$WORK/api.key"
+    out="$WORK/out-key-mode.txt"
+    err="$WORK/out-key-mode.err"
+    bash "$KEY" >"$out" 2>"$err"
+    expect_rc 2 $? "guest-key refuses group-readable token"
+    expect_out "$err" "readable by group or others" "guest-key token mode says so"
+    chmod 600 "$WORK/api.key"
+else
+    echo "skip: POSIX mode bits are not available here"
+fi
 
 comment "guest-key: API refuses"
 start_api "$WORK/ready.hujson" --keys-status 403

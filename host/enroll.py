@@ -94,7 +94,10 @@ class EnrollServer(ThreadingHTTPServer):
     once, which looked like a rate-limit reply of 0 to the caller.
     """
 
-    daemon_threads = True
+    daemon_threads = False
+    # server_close() waits for the handler, so a shutdown after one
+    # success cannot cut the last response in half.
+    block_on_close = True
     request_queue_size = 128
 
 

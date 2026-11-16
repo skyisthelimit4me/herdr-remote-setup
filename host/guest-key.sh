@@ -105,7 +105,8 @@ def read_key_file():
         with open(KEY_FILE, "rb") as handle:
             info = os.fstat(handle.fileno())
             mode = stat.S_IMODE(info.st_mode)
-            if not key_file_layout_ok(mode, info.st_uid, os.geteuid()):
+            euid = effective_uid()
+            if euid >= 0 and not key_file_layout_ok(mode, info.st_uid, euid):
                 if mode & 0o077:
                     print("X %s is readable by group or others" % KEY_FILE, file=sys.stderr)
                     print("  Run: sudo chmod 600 %s" % KEY_FILE, file=sys.stderr)
@@ -121,6 +122,12 @@ def read_key_file():
         print("X %s is empty" % KEY_FILE, file=sys.stderr)
         return None
     return key
+
+
+def effective_uid():
+    """The caller's uid, or -1 where the platform has none, such as Windows."""
+    getter = getattr(os, "geteuid", None)
+    return getter() if getter else -1
 
 
 def key_file_layout_ok(mode, uid, euid):

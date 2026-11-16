@@ -26,6 +26,15 @@ Fix pairing races and watchdog false positives.
 - `client/watchdog.ps1` and `client/watchdog-macos.sh`: match only the TUI
   command, `herdr` or `herdr --machine`. They no longer stop `herdr status`,
   `herdr-core`, the SSH helper, or an unrelated job.
+- `host/enroll.py` and `host/pair.py`: serve concurrently with a backlog of 128.
+  A burst of twenty parallel attempts used to overflow the default queue of 5,
+  and the refused connections looked like an empty reply.
+- `host/pair.py`: `--once` keeps the listener open for half a second after the
+  successful reply, so a request that arrived in the same burst still gets its
+  401 instead of a connection reset.
+- `host/ensure-acl.sh` and `host/guest-key.sh`: the token ownership check is
+  skipped where the platform has no user id, so the suite runs on Windows. The
+  POSIX-only mode cases report `skip` there.
 
 ### Added
 

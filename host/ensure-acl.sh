@@ -340,6 +340,12 @@ def merge_entries(policy, problems):
     return merged, added
 
 
+def effective_uid():
+    """The caller's uid, or -1 where the platform has none, such as Windows."""
+    getter = getattr(os, "geteuid", None)
+    return getter() if getter else -1
+
+
 def key_file_layout_ok(mode, uid, euid):
     if mode & 0o077:
         return False
@@ -353,7 +359,8 @@ def read_key():
         with open(KEY_FILE, "rb") as handle:
             info = os.fstat(handle.fileno())
             mode = stat.S_IMODE(info.st_mode)
-            if not key_file_layout_ok(mode, info.st_uid, os.geteuid()):
+            euid = effective_uid()
+            if euid >= 0 and not key_file_layout_ok(mode, info.st_uid, euid):
                 if mode & 0o077:
                     print("! the API token file is readable by group or others")
                     print("  Run: sudo chmod 600 %s" % KEY_FILE)
