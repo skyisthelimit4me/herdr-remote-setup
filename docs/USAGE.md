@@ -95,6 +95,9 @@ Tailscale API token, created once, stored once.
    sudo chmod 600 /etc/herdr-setup/tailscale-api.key
    ```
 
+   The scripts refuse a token file that group or others can read, or that root
+   does not own. A refusal is exit 2, and the PIN flow continues.
+
 3. Check the policy without changing it.
 
    ```bash
@@ -149,6 +152,10 @@ and expires after 30 minutes by default.
 | `--bind 100.x.y.z` | Bind address. Default is the Tailscale IPv4 |
 | `--no-join-code` | PIN only, no API call, no join code |
 | `--no-acl-write` | Check the policy, never write it |
+
+`--port` also updates the ACL grant, so a custom port works end to end. Run
+`sudo bash host/ensure-acl.sh --port N` to check that grant on its own; add
+`--no-acl-write` to leave the policy alone.
 
 The join code is a secret. Do not paste it into a ticket or a chat. It works
 once, expires after one hour, and the host prints it to the terminal only.
